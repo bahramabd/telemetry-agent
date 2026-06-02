@@ -14,6 +14,7 @@ class Settings(BaseModel):
     anthropic_api_key: str | None = None
     anthropic_model: str = "claude-3-5-haiku-latest"
     debug_intent: bool = False
+    enable_llm_synthesis: bool = False
 
 
 def get_settings() -> Settings:
@@ -30,4 +31,6 @@ def get_settings() -> Settings:
             "claude-3-5-haiku-latest",
         ),
         debug_intent=os.getenv("DEBUG_INTENT", "false").lower() == "true",
+        enable_llm_synthesis=os.getenv("ENABLE_LLM_SYNTHESIS", "false").lower()
+        == "true",
     )

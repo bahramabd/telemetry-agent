@@ -6,8 +6,15 @@ from typing import Optional
 
 from pydantic import BaseModel
 from pymongo.database import Database
+
+from src.answer_synthesizer import (
+    is_answer_synthesis_enabled,
+    synthesize_general_answer,
+    synthesize_rca_answer,
+)
 from src.config import Settings
 from src.intent_parser import LLMParsedIntent, parse_question_with_llm
+from src.telemetry.evidence import collect_evidence_bundle
 from src.telemetry.health import (
     get_checkout_flow_health,
     get_highest_error_rate_service,
@@ -34,6 +41,12 @@ class AgentIntent(BaseModel):
     time_parse_error: Optional[str] = None
     parse_reason: Optional[str] = None
     parse_source: str = "fallback"
+
+
+class AgentExecution(BaseModel):
+    answer: str
+    rca_result: Optional[dict[str, object]] = None
+    time_range: Optional[TimeRange] = None
 
 
 def parse_question_fallback(question: str) -> AgentIntent:
@@ -94,11 +107,11 @@ def parse_question_fallback(question: str) -> AgentIntent:
         r"from\s+([0-9:apm\s]+)\s+to\s+([0-9:apm\s]+)",
         r"\b([0-9:apm\s]+)-([0-9:apm\s]+)\b",
     ]
-    for pat in range_patterns:
-        m = re.search(pat, text)
-        if m:
-            start_time = m.group(1).strip()
-            end_time = m.group(2).strip()
+    for pattern in range_patterns:
+        match = re.search(pattern, text)
+        if match:
+            start_time = match.group(1).strip()
+            end_time = match.group(2).strip()
             break
 
     if rel_match is None and start_time is None and end_time is None:
@@ -146,17 +159,21 @@ def _llm_parsed_to_agent_intent(
 def parse_question(
     question: str,
     settings: Optional[Settings] = None,
+    history: list[dict] | None = None,
 ) -> AgentIntent:
     if settings is not None:
-        parsed = parse_question_with_llm(settings, question)
+        parsed = parse_question_with_llm(settings, question, history=history)
         if parsed is not None:
             return _llm_parsed_to_agent_intent(parsed, question)
 
     return parse_question_fallback(question)
 
 
-def _format_time_range(tr: TimeRange) -> str:
-    return f"{tr.label} ({tr.start.isoformat()} -> {tr.end.isoformat()})"
+def _format_time_range(time_range: TimeRange) -> str:
+    return (
+        f"{time_range.label} "
+        f"({time_range.start.isoformat()} -> {time_range.end.isoformat()})"
+    )
 
 
 def _user_specified_time(intent: AgentIntent) -> bool:
@@ -181,6 +198,7 @@ def _baseline_row_is_significant(row: dict[str, object]) -> bool:
         return True
     if isinstance(multiplier, (int, float)) and multiplier >= 2:
         return True
+
     return False
 
 
@@ -198,8 +216,10 @@ def _timeline_shows_checkout_cascade(timeline: list[dict[str, object]]) -> bool:
             if isinstance(first_problem_time, datetime):
                 times.append(first_problem_time)
             break
+
     if len(times) < 2:
         return False
+
     return times == sorted(times)
 
 
@@ -220,7 +240,7 @@ def _format_rca_answer(result: dict[str, object]) -> str:
     affected_services = result.get("affected_services")
     if isinstance(affected_services, list) and affected_services:
         lines.append(
-            f"Affected services: {', '.join(str(s) for s in affected_services)}"
+            f"Affected services: {', '.join(str(service) for service in affected_services)}"
         )
     else:
         lines.append("Affected services: none")
@@ -228,7 +248,9 @@ def _format_rca_answer(result: dict[str, object]) -> str:
     lines.append("")
     lines.append("Probable root cause:")
     lines.append(str(result.get("probable_root_cause", "Unknown")))
-    lines.append(f"Confidence: {result.get('confidence', 'low')}")
+    confidence = result.get("confidence", "high")
+    if incident_detected and confidence == "high":
+        lines.append("Confidence: high")
 
     baseline_comparison = result.get("baseline_comparison")
     significant_baseline_rows: list[dict[str, object]] = []
@@ -244,12 +266,14 @@ def _format_rca_answer(result: dict[str, object]) -> str:
             service_name = row.get("service_name")
             baseline_p99 = row.get("baseline_p99_latency_ms")
             incident_p99 = row.get("incident_p99_latency_ms")
+
             if not isinstance(service_name, str):
                 continue
             if not isinstance(baseline_p99, (int, float)) or not isinstance(
                 incident_p99, (int, float)
             ):
                 continue
+
             multiplier = row.get("latency_multiplier")
             multiplier_text = (
                 f" ({multiplier}x higher)"
@@ -268,6 +292,7 @@ def _format_rca_answer(result: dict[str, object]) -> str:
         lines.append("")
         lines.append("Observed failure timeline:")
         typed_timeline = [item for item in failure_timeline if isinstance(item, dict)]
+
         for item in typed_timeline:
             time_label = _format_timeline_time(item.get("first_problem_time"))
             service_name = item.get("service_name", "unknown")
@@ -279,6 +304,7 @@ def _format_rca_answer(result: dict[str, object]) -> str:
                 f"- {time_label} {service_name} first problem: {operation} "
                 f"({duration_ms}ms, {status_code}, {signal_type})"
             )
+
         if not _timeline_shows_checkout_cascade(typed_timeline):
             lines.append(
                 "- Note: Affected services degraded in the same incident window; "
@@ -305,23 +331,23 @@ def _format_rca_answer(result: dict[str, object]) -> str:
     top_slow = result.get("top_slow_operations")
     suspicious_ops: list[dict[str, object]] = []
     if isinstance(top_slow, list):
-        for op in top_slow:
-            if not isinstance(op, dict):
+        for operation in top_slow:
+            if not isinstance(operation, dict):
                 continue
-            error_rate = op.get("error_rate_percent", 0)
-            max_latency = op.get("max_latency_ms") or 0
+            error_rate = operation.get("error_rate_percent", 0)
+            max_latency = operation.get("max_latency_ms") or 0
             if (isinstance(error_rate, (int, float)) and error_rate > 0) or (
                 isinstance(max_latency, (int, float)) and max_latency >= 1000
             ):
-                suspicious_ops.append(op)
+                suspicious_ops.append(operation)
 
     lines.append("- Slow/error-prone operations:")
     if suspicious_ops:
-        for op in suspicious_ops[:5]:
+        for operation in suspicious_ops[:5]:
             lines.append(
-                f"  - {op.get('service_name')}/{op.get('operation')}: "
-                f"error_rate={op.get('error_rate_percent')}%, "
-                f"max_latency={op.get('max_latency_ms')} ms"
+                f"  - {operation.get('service_name')}/{operation.get('operation')}: "
+                f"error_rate={operation.get('error_rate_percent')}%, "
+                f"max_latency={operation.get('max_latency_ms')} ms"
             )
     else:
         lines.append("  - none")
@@ -340,7 +366,7 @@ def _format_rca_answer(result: dict[str, object]) -> str:
             service = entry.get("service_name", "unknown")
             severity = entry.get("severity", "")
             count = entry.get("count", 0)
-            message = entry.get("message", "")
+            message = str(entry.get("message", "")).strip()
             lines.append(f"  - [{service}/{severity} x{count}] {message}")
     else:
         lines.append("  - none")
@@ -350,7 +376,7 @@ def _format_rca_answer(result: dict[str, object]) -> str:
     if isinstance(span_status_evidence, list) and span_status_evidence:
         for entry in span_status_evidence[:5]:
             if isinstance(entry, str):
-                lines.append(f"  - {entry}")
+                lines.append(f"  - {entry.strip()}")
     else:
         lines.append("  - none")
 
@@ -382,13 +408,12 @@ def _format_rca_answer(result: dict[str, object]) -> str:
     lines.append(str(result.get("blast_radius", "")))
 
     if not incident_detected:
-        lines.insert(
-            1,
-            "No major incident was detected in the selected window.",
-        )
+        lines.insert(1, "No major incident was detected in the selected window.")
         service_health = result.get("service_health")
         if isinstance(service_health, list) and service_health:
-            healthy = sum(1 for s in service_health if s.get("status") == "healthy")
+            healthy = sum(
+                1 for service in service_health if service.get("status") == "healthy"
+            )
             lines.insert(
                 2,
                 f"Brief health: {healthy}/{len(service_health)} services healthy in window.",
@@ -406,12 +431,15 @@ def _format_rca_answer(result: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
-def execute_intent(db: Database, intent: AgentIntent) -> str:
+def execute_intent_with_result(db: Database, intent: AgentIntent) -> AgentExecution:
+    time_range: Optional[TimeRange] = None
     if intent.time_parse_error:
-        return (
-            f"I couldn't understand that time range: {intent.time_parse_error} "
-            "Try examples like 'last 12 minutes', 'between 14:00 and 14:45', "
-            "or 'from 2pm to 2:45pm'."
+        return AgentExecution(
+            answer=(
+                f"I couldn't understand that time range: {intent.time_parse_error} "
+                "Try examples like 'last 12 minutes', 'between 14:00 and 14:45', "
+                "or 'from 2pm to 2:45pm'."
+            )
         )
 
     if intent.intent == "rca_recent_incident":
@@ -426,13 +454,24 @@ def execute_intent(db: Database, intent: AgentIntent) -> str:
                 rca_result = run_rca(db, time_range)
             else:
                 rca_result = run_rca(db, None)
+                raw_time_range = rca_result.get("time_range")
+                time_range = (
+                    raw_time_range if isinstance(raw_time_range, TimeRange) else None
+                )
         except ValueError as exc:
-            return (
-                f"I couldn't understand that time range: {exc} "
-                "Try examples like 'last 12 minutes', 'between 14:00 and 14:45', "
-                "or 'from 2pm to 2:45pm'."
+            return AgentExecution(
+                answer=(
+                    f"I couldn't understand that time range: {exc} "
+                    "Try examples like 'last 12 minutes', 'between 14:00 and 14:45', "
+                    "or 'from 2pm to 2:45pm'."
+                )
             )
-        return _format_rca_answer(rca_result)
+
+        return AgentExecution(
+            answer=_format_rca_answer(rca_result),
+            rca_result=rca_result,
+            time_range=time_range,
+        )
 
     try:
         time_range = resolve_time_range(
@@ -442,10 +481,12 @@ def execute_intent(db: Database, intent: AgentIntent) -> str:
             window_minutes=intent.window_minutes,
         )
     except ValueError as exc:
-        return (
-            f"I couldn't understand that time range: {exc} "
-            "Try examples like 'last 12 minutes', 'between 14:00 and 14:45', "
-            "or 'from 2pm to 2:45pm'."
+        return AgentExecution(
+            answer=(
+                f"I couldn't understand that time range: {exc} "
+                "Try examples like 'last 12 minutes', 'between 14:00 and 14:45', "
+                "or 'from 2pm to 2:45pm'."
+            )
         )
 
     if intent.intent == "overall_health":
@@ -453,8 +494,11 @@ def execute_intent(db: Database, intent: AgentIntent) -> str:
         summary = result["summary"]
         services = result["services"]
         highest_error_service = (
-            max(services, key=lambda s: s["error_rate_percent"]) if services else None
+            max(services, key=lambda service: service["error_rate_percent"])
+            if services
+            else None
         )
+
         if (
             highest_error_service is None
             or highest_error_service["error_rate_percent"] == 0
@@ -466,6 +510,7 @@ def execute_intent(db: Database, intent: AgentIntent) -> str:
             highest_error_line = (
                 f"Highest error rate service: {highest_error_service['service_name']}"
             )
+
         lines = [
             f"Overall health: {result['overall_status']}",
             f"Time range: {_format_time_range(time_range)}",
@@ -473,17 +518,25 @@ def execute_intent(db: Database, intent: AgentIntent) -> str:
             highest_error_line,
             f"Slowest service by p99: {summary['slowest_service_by_p99']}",
         ]
-        return "\n".join(lines)
+        return AgentExecution(answer="\n".join(lines), time_range=time_range)
 
     if intent.intent == "highest_error_rate":
         highest = get_highest_error_rate_service(db, time_range.start, time_range.end)
         if not highest:
-            return "No services found in the selected time range."
-        if highest["error_rate_percent"] == 0:
-            return (
-                "No errors were observed in the selected time range.\n"
-                f"Time range: {_format_time_range(time_range)}"
+            return AgentExecution(
+                answer="No services found in the selected time range.",
+                time_range=time_range,
             )
+
+        if highest["error_rate_percent"] == 0:
+            return AgentExecution(
+                answer=(
+                    "No errors were observed in the selected time range.\n"
+                    f"Time range: {_format_time_range(time_range)}"
+                ),
+                time_range=time_range,
+            )
+
         lines = [
             "Service with highest error rate:",
             f"Time range: {_format_time_range(time_range)}",
@@ -494,21 +547,32 @@ def execute_intent(db: Database, intent: AgentIntent) -> str:
             f"- p95 latency: {highest['p95_latency_ms']} ms",
             f"- p99 latency: {highest['p99_latency_ms']} ms",
         ]
-        return "\n".join(lines)
+        return AgentExecution(answer="\n".join(lines), time_range=time_range)
 
     if intent.intent == "service_latency":
         if not intent.service_name:
-            return (
-                "Could not determine which service you are asking about for latency. "
-                "Try mentioning order, payments, cart, or catalog explicitly."
+            return AgentExecution(
+                answer=(
+                    "Could not determine which service you are asking about for latency. "
+                    "Try mentioning order, payments, cart, or catalog explicitly."
+                ),
+                time_range=time_range,
             )
+
         stats = get_service_latency(
-            db, intent.service_name, time_range.start, time_range.end
+            db,
+            intent.service_name,
+            time_range.start,
+            time_range.end,
         )
         if not stats:
-            return (
-                f"No spans found for {intent.service_name} in the selected time range."
+            return AgentExecution(
+                answer=(
+                    f"No spans found for {intent.service_name} in the selected time range."
+                ),
+                time_range=time_range,
             )
+
         lines = [
             f"Latency for {intent.service_name}:",
             f"Time range: {_format_time_range(time_range)}",
@@ -519,20 +583,25 @@ def execute_intent(db: Database, intent: AgentIntent) -> str:
             f"- p99 latency: {stats['p99_latency_ms']} ms",
             f"- Max latency: {stats['max_latency_ms']} ms",
         ]
-        return "\n".join(lines)
+        return AgentExecution(answer="\n".join(lines), time_range=time_range)
 
     if intent.intent == "checkout_health":
         result = get_checkout_flow_health(db, time_range)
         lines = [
             f"Checkout flow health: {result['checkout_status']}",
             f"Time range: {_format_time_range(time_range)}",
-            result["interpretation"],
+            str(result["interpretation"]),
         ]
-        for svc in result["services"]:
+
+        for service in result["services"]:
             lines.append(
-                f"- {svc['service_name']}: status={svc['status']}, error_rate={svc['error_rate_percent']}%, p95={svc['p95_latency_ms']} ms, p99={svc['p99_latency_ms']} ms"
+                f"- {service['service_name']}: status={service['status']}, "
+                f"error_rate={service['error_rate_percent']}%, "
+                f"p95={service['p95_latency_ms']} ms, "
+                f"p99={service['p99_latency_ms']} ms"
             )
-        return "\n".join(lines)
+
+        return AgentExecution(answer="\n".join(lines), time_range=time_range)
 
     examples = [
         "Examples of supported questions:",
@@ -543,33 +612,96 @@ def execute_intent(db: Database, intent: AgentIntent) -> str:
         "- Run RCA on the most recent incident",
         "- What was the root cause between 14:00 and 14:45?",
     ]
-    return (
-        "I could not understand this question with the current fallback parser.\n"
-        + "\n".join(examples)
+    return AgentExecution(
+        answer="I could not understand this question with the current parser.\n"
+        + "\n".join(examples),
+        time_range=time_range,
     )
+
+
+def execute_intent(db: Database, intent: AgentIntent) -> str:
+    return execute_intent_with_result(db, intent).answer
+
+
+def _debug_intent_block(intent: AgentIntent) -> str:
+    debug_lines = [
+        "[debug]",
+        f"- parser: {intent.parse_source}",
+        f"- intent: {intent.intent}",
+        f"- service_name: {intent.service_name}",
+        f"- metric: {intent.metric}",
+        f"- start_time: {intent.start_time}",
+        f"- end_time: {intent.end_time}",
+        f"- window_minutes: {intent.window_minutes}",
+        f"- reason: {intent.parse_reason}",
+        "",
+    ]
+    return "\n".join(debug_lines)
+
+
+def _maybe_synthesize_answer(
+    db: Database,
+    question: str,
+    settings: Optional[Settings],
+    intent: AgentIntent,
+    execution: AgentExecution,
+) -> str:
+    """Optionally synthesize a final LLM answer from deterministic evidence.
+
+    If synthesis is disabled or fails, return the deterministic answer.
+    """
+
+    if settings is None or not is_answer_synthesis_enabled(settings):
+        return execution.answer
+
+    if intent.intent == "unsupported" or intent.time_parse_error:
+        return execution.answer
+
+    try:
+        if intent.intent == "rca_recent_incident":
+            if execution.rca_result is None:
+                return execution.answer
+
+            synthesized = synthesize_rca_answer(
+                settings=settings,
+                question=question,
+                rca_result=execution.rca_result,
+            )
+            return synthesized or execution.answer
+
+        if execution.time_range is None:
+            return execution.answer
+
+        evidence = collect_evidence_bundle(db, execution.time_range)
+
+        synthesized = synthesize_general_answer(
+            settings=settings,
+            question=question,
+            deterministic_answer=execution.answer,
+            evidence=evidence,
+        )
+        return synthesized or execution.answer
+
+    except Exception:
+        return execution.answer
 
 
 def answer_question(
     db: Database,
     question: str,
     settings: Optional[Settings] = None,
+    history: list[dict] | None = None,
 ) -> str:
-    intent = parse_question(question, settings)
-    answer = execute_intent(db, intent)
+    intent = parse_question(question, settings, history=history)
+    execution = execute_intent_with_result(db, intent)
 
     if settings is not None and settings.debug_intent:
-        debug_lines = [
-            "[debug]",
-            f"- parser: {intent.parse_source}",
-            f"- intent: {intent.intent}",
-            f"- service_name: {intent.service_name}",
-            f"- metric: {intent.metric}",
-            f"- start_time: {intent.start_time}",
-            f"- end_time: {intent.end_time}",
-            f"- window_minutes: {intent.window_minutes}",
-            f"- reason: {intent.parse_reason}",
-            "",
-        ]
-        return "\n".join(debug_lines) + answer
+        return _debug_intent_block(intent) + execution.answer
 
-    return answer
+    return _maybe_synthesize_answer(
+        db=db,
+        question=question,
+        settings=settings,
+        intent=intent,
+        execution=execution,
+    )

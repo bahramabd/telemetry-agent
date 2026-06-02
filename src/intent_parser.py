@@ -99,6 +99,7 @@ def parse_llm_intent_text(text: str) -> LLMParsedIntent:
 def parse_question_with_llm(
     settings: Settings,
     question: str,
+    history: list[dict] | None = None,  # ADD
 ) -> Optional[LLMParsedIntent]:
     """Parse a user question with the configured LLM.
 
@@ -110,7 +111,7 @@ def parse_question_with_llm(
     if not is_llm_configured(settings):
         return None
 
-    user_prompt = build_intent_parser_user_prompt(question)
+    user_prompt = build_intent_parser_user_prompt(question, history=history)
 
     try:
         response = call_llm(

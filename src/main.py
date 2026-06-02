@@ -71,6 +71,9 @@ def run() -> None:
 
     console.print("Telemetry CLI ready. Type your question or 'exit' to quit.")
 
+    # Conversation history for multi-turn context
+    history: list[dict] = []
+
     while True:
         user_input = input("> ").strip()
 
@@ -81,8 +84,13 @@ def run() -> None:
         if not user_input:
             continue
 
-        answer = answer_question(db, user_input, settings)
+        answer = answer_question(db, user_input, settings, history=history)
         console.print(answer)
+
+        # Update history after each turn — keep last 3 only
+        history.append({"question": user_input})
+        if len(history) > 3:
+            history = history[-3:]
 
 
 if __name__ == "__main__":

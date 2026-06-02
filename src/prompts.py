@@ -81,19 +81,48 @@ Intent rules:
   unsupported
 
 Important:
-- If the user asks "what happened" together with a time range, classify as rca_recent_incident.
-- If the user asks "why" something failed, classify as rca_recent_incident.
-- If the user asks for latency but no service is clear, classify as unsupported.
+- If the user asks for latency but no service is clear, check history first.
+  If history shows a specific service was discussed, use that service.
+  If history has no service context either, ask the user to clarify by returning
+  unsupported with reason "Please specify a service: order, payments, cart, or catalog."
+
 - If service is not relevant to the intent, set service_name to null.
+
+- Avoid classifying as unsupported unless the question is completely unrelated
+  to telemetry, system health, latency, errors, or incidents.
+  Examples of things that should NOT be unsupported:
+  - Short follow-up questions like "what about 2 to 2:45", "and payments?", "same for order"
+  - Questions with only a time range and no explicit intent word
+  - Vague questions like "how does it look?" or "anything wrong?"
+  
+- For vague questions with no time and no clear intent:
+  default to overall_health rather than unsupported.
+  
+- Only use unsupported for questions clearly outside telemetry scope,
+  for example: "what is the weather?", "write me a poem", "who is the CEO?"
 """
 
 
-def build_intent_parser_user_prompt(question: str) -> str:
-    return f"""Parse this telemetry question into the required JSON object.
-
-Question:
-{question}
-"""
+def build_intent_parser_user_prompt(
+    question: str,
+    history: list[dict] | None = None,
+) -> str:
+    context = ""
+    if history:
+        context = "Recent conversation for context only:\n"
+        for turn in history[-2:]:
+            context += f"User said: {turn['question']}\n"
+        context += (
+            "Use this history ONLY if the current question is incomplete "
+            "or refers to a previous topic (e.g. 'now tell me', 'same for', "
+            "'what about', 'and from'). "
+            "Do NOT assume the current question has the same intent as history.\n\n"
+        )
+    return (
+        f"{context}"
+        f"Parse this telemetry question into the required JSON object.\n\n"
+        f"Question:\n{question}"
+    )
 
 
 ANSWER_SYNTHESIS_SYSTEM_PROMPT = f"""You are a senior SRE assistant explaining telemetry analysis.
