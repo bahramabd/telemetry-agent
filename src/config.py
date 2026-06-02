@@ -13,6 +13,7 @@ class Settings(BaseModel):
     llm_model: str = "gpt-4o-mini"
     anthropic_api_key: str | None = None
     anthropic_model: str = "claude-3-5-haiku-latest"
+    debug_intent: bool = False
 
 
 def get_settings() -> Settings:
@@ -28,4 +29,5 @@ def get_settings() -> Settings:
             "ANTHROPIC_MODEL",
             "claude-3-5-haiku-latest",
         ),
+        debug_intent=os.getenv("DEBUG_INTENT", "false").lower() == "true",
     )

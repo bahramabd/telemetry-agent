@@ -81,7 +81,7 @@ def run() -> None:
         if not user_input:
             continue
 
-        answer = answer_question(db, user_input)
+        answer = answer_question(db, user_input, settings)
         console.print(answer)
 
 

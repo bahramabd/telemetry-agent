@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import Any, cast
+from typing import cast
 
 from pydantic import BaseModel
 
@@ -36,10 +36,7 @@ def serialize_for_llm(value: object) -> object:
         return serialize_for_llm(value.model_dump())
 
     if isinstance(value, dict):
-        return {
-            str(key): serialize_for_llm(item)
-            for key, item in value.items()
-        }
+        return {str(key): serialize_for_llm(item) for key, item in value.items()}
 
     if isinstance(value, set):
         return [serialize_for_llm(item) for item in sorted(str(i) for i in value)]

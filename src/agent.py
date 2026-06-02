@@ -6,7 +6,8 @@ from typing import Optional
 
 from pydantic import BaseModel
 from pymongo.database import Database
-
+from src.config import Settings
+from src.intent_parser import LLMParsedIntent, parse_question_with_llm
 from src.telemetry.health import (
     get_checkout_flow_health,
     get_highest_error_rate_service,
@@ -31,6 +32,8 @@ class AgentIntent(BaseModel):
     end_time: Optional[str] = None
     window_minutes: Optional[int] = None
     time_parse_error: Optional[str] = None
+    parse_reason: Optional[str] = None
+    parse_source: str = "fallback"
 
 
 def parse_question_fallback(question: str) -> AgentIntent:
@@ -117,7 +120,39 @@ def parse_question_fallback(question: str) -> AgentIntent:
         end_time=end_time,
         window_minutes=window_minutes,
         time_parse_error=time_parse_error,
+        parse_reason="Parsed by deterministic fallback parser.",
+        parse_source="fallback",
     )
+
+
+def _llm_parsed_to_agent_intent(
+    parsed: LLMParsedIntent,
+    original_question: str,
+) -> AgentIntent:
+    return AgentIntent(
+        intent=parsed.intent,
+        original_question=original_question,
+        service_name=parsed.service_name,
+        metric=parsed.metric,
+        start_time=parsed.start_time,
+        end_time=parsed.end_time,
+        window_minutes=parsed.window_minutes,
+        time_parse_error=None,
+        parse_reason=parsed.reason,
+        parse_source="llm",
+    )
+
+
+def parse_question(
+    question: str,
+    settings: Optional[Settings] = None,
+) -> AgentIntent:
+    if settings is not None:
+        parsed = parse_question_with_llm(settings, question)
+        if parsed is not None:
+            return _llm_parsed_to_agent_intent(parsed, question)
+
+    return parse_question_fallback(question)
 
 
 def _format_time_range(tr: TimeRange) -> str:
@@ -514,6 +549,27 @@ def execute_intent(db: Database, intent: AgentIntent) -> str:
     )
 
 
-def answer_question(db: Database, question: str) -> str:
-    intent = parse_question_fallback(question)
-    return execute_intent(db, intent)
+def answer_question(
+    db: Database,
+    question: str,
+    settings: Optional[Settings] = None,
+) -> str:
+    intent = parse_question(question, settings)
+    answer = execute_intent(db, intent)
+
+    if settings is not None and settings.debug_intent:
+        debug_lines = [
+            "[debug]",
+            f"- parser: {intent.parse_source}",
+            f"- intent: {intent.intent}",
+            f"- service_name: {intent.service_name}",
+            f"- metric: {intent.metric}",
+            f"- start_time: {intent.start_time}",
+            f"- end_time: {intent.end_time}",
+            f"- window_minutes: {intent.window_minutes}",
+            f"- reason: {intent.parse_reason}",
+            "",
+        ]
+        return "\n".join(debug_lines) + answer
+
+    return answer
