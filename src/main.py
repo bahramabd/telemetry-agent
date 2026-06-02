@@ -7,6 +7,7 @@ from rich.console import Console
 from src.config import get_settings
 from src.db import get_database, ping_database
 from src.telemetry.profile import get_dataset_profile
+from src.agent import answer_question
 
 
 def run() -> None:
@@ -80,7 +81,8 @@ def run() -> None:
         if not user_input:
             continue
 
-        console.print("Analysis not implemented yet. Next step is telemetry profiling.")
+        answer = answer_question(db, user_input)
+        console.print(answer)
 
 
 if __name__ == "__main__":
