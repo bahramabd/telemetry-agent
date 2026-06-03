@@ -1,0 +1,17 @@
+version: "3.8"
+
+services:
+  agent:
+    build: .
+    image: telemetry-agent
+    stdin_open: true
+    tty: true
+    environment:
+      - MONGO_URI=mongodb://host.docker.internal:27017/telemetry
+      - LLM_PROVIDER=openai
+      - LLM_MODEL=gpt-4o-mini
+      - LLM_API_KEY=${LLM_API_KEY}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+      - ANTHROPIC_MODEL=claude-opus-4-5
+      - ENABLE_LLM_SYNTHESIS=${ENABLE_LLM_SYNTHESIS:-false}
+      - DEBUG_INTENT=${DEBUG_INTENT:-false}

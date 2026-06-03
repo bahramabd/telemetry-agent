@@ -14,13 +14,14 @@ from src.answer_synthesizer import (
 )
 from src.config import Settings
 from src.intent_parser import LLMParsedIntent, parse_question_with_llm
-from src.telemetry.evidence import collect_evidence_bundle
 from src.telemetry.health import (
     get_checkout_flow_health,
     get_highest_error_rate_service,
     get_overall_health,
     get_service_latency,
 )
+from src.telemetry.logs import get_error_logs_summary
+from src.telemetry.metrics import get_metric_anomalies
 from src.telemetry.rca import run_rca
 from src.telemetry.time_utils import TimeRange, resolve_time_range
 
@@ -46,13 +47,14 @@ class AgentIntent(BaseModel):
 class AgentExecution(BaseModel):
     answer: str
     rca_result: Optional[dict[str, object]] = None
+    health_result: Optional[dict[str, object]] = None
     time_range: Optional[TimeRange] = None
 
 
 def parse_question_fallback(question: str) -> AgentIntent:
     text = question.lower()
 
-    intent = "unsupported"
+    intent = "overall_health"
     service: Optional[str] = None
     metric: Optional[str] = None
 
@@ -221,6 +223,14 @@ def _timeline_shows_checkout_cascade(timeline: list[dict[str, object]]) -> bool:
         return False
 
     return times == sorted(times)
+
+
+def _service_indicator(status: str) -> str:
+    if status == "healthy":
+        return "✓"
+    if status == "degraded":
+        return "⚠"
+    return "✗"
 
 
 def _format_rca_answer(result: dict[str, object]) -> str:
@@ -431,8 +441,165 @@ def _format_rca_answer(result: dict[str, object]) -> str:
     return "\n".join(lines)
 
 
+def _format_overall_health_answer(
+    result: dict[str, object],
+    time_range: TimeRange,
+) -> str:
+    summary = result["summary"]
+    services = result.get("services", [])
+
+    status = str(result.get("overall_status", "unknown")).upper()
+    total = summary.get("total_services", 0)
+    critical = summary.get("critical_services", 0)
+    degraded = summary.get("degraded_services", 0)
+
+    if status == "HEALTHY":
+        summary_line = (
+            f"All {total} services are operating normally "
+            "with no errors or latency spikes detected."
+        )
+    elif status == "DEGRADED":
+        summary_line = (
+            f"{degraded} of {total} services show elevated latency or error rates."
+        )
+    else:
+        summary_line = (
+            f"{critical} of {total} services are in a critical state "
+            "with high error rates or severe latency."
+        )
+
+    lines = [
+        f"System Health: {status}",
+        f"Time range: {_format_time_range(time_range)}",
+        "",
+        summary_line,
+        "",
+        "Service breakdown:",
+    ]
+
+    for svc in services:
+        name = str(svc.get("service_name", "unknown"))
+        svc_status = str(svc.get("status", "unknown"))
+        p99 = svc.get("p99_latency_ms")
+        error_rate = svc.get("error_rate_percent", 0)
+        p99_str = f"{p99}ms" if p99 is not None else "n/a"
+        indicator = _service_indicator(svc_status)
+        lines.append(
+            f"  {indicator} {name:<22} {svc_status:<10} "
+            f"p99={p99_str:<10} error_rate={error_rate}%"
+        )
+
+    lines.append("")
+    if status == "HEALTHY":
+        lines.append("No anomalies detected in this window.")
+    else:
+        highest = summary.get("highest_error_rate_service")
+        slowest = summary.get("slowest_service_by_p99")
+        if highest:
+            lines.append(f"Highest error rate: {highest}")
+        if slowest:
+            lines.append(f"Slowest by p99: {slowest}")
+
+    return "\n".join(lines)
+
+
+def _format_highest_error_rate_answer(
+    highest: dict[str, object],
+    time_range: TimeRange,
+) -> str:
+    name = str(highest.get("service_name", "unknown"))
+    error_rate = highest.get("error_rate_percent", 0)
+    error_spans = highest.get("error_spans", 0)
+    total_spans = highest.get("total_spans", 0)
+    p95 = highest.get("p95_latency_ms")
+    p99 = highest.get("p99_latency_ms")
+
+    lines = [
+        f"Highest Error Rate Service: {name}",
+        f"Time range: {_format_time_range(time_range)}",
+        "",
+        f"{name} had the highest error rate in this window with "
+        f"{error_rate}% of requests failing "
+        f"({error_spans} errors out of {total_spans} total spans).",
+        "",
+        f"  - Error rate:  {error_rate}%",
+        f"  - p95 latency: {p95}ms",
+        f"  - p99 latency: {p99}ms",
+        f"  - Total spans: {total_spans}",
+        f"  - Error spans: {error_spans}",
+    ]
+    return "\n".join(lines)
+
+
+def _format_service_latency_answer(
+    service_name: str,
+    stats: dict[str, object],
+    time_range: TimeRange,
+) -> str:
+    p99 = stats.get("p99_latency_ms") or 0
+
+    if p99 >= 3000:
+        assessment = (
+            f"p99 latency is critically high at {p99}ms "
+            "— well above the 3000ms threshold."
+        )
+    elif p99 >= 1000:
+        assessment = (
+            f"p99 latency is elevated at {p99}ms "
+            "— above the 1000ms warning threshold."
+        )
+    else:
+        assessment = f"p99 latency is within normal bounds at {p99}ms."
+
+    lines = [
+        f"Latency Report: {service_name}",
+        f"Time range: {_format_time_range(time_range)}",
+        "",
+        assessment,
+        "",
+        f"  - Total spans:  {stats.get('total_spans')}",
+        f"  - Avg latency:  {stats.get('avg_latency_ms')}ms",
+        f"  - p50 latency:  {stats.get('p50_latency_ms')}ms",
+        f"  - p95 latency:  {stats.get('p95_latency_ms')}ms",
+        f"  - p99 latency:  {stats.get('p99_latency_ms')}ms",
+        f"  - Max latency:  {stats.get('max_latency_ms')}ms",
+    ]
+    return "\n".join(lines)
+
+
+def _format_checkout_health_answer(
+    result: dict[str, object],
+    time_range: TimeRange,
+) -> str:
+    status = str(result.get("checkout_status", "unknown")).upper()
+
+    lines = [
+        f"Checkout Flow Health: {status}",
+        f"Time range: {_format_time_range(time_range)}",
+        "",
+        str(result.get("interpretation", "")),
+        "",
+        "Service breakdown:",
+    ]
+
+    for svc in result.get("services", []):
+        name = str(svc.get("service_name", "unknown"))
+        svc_status = str(svc.get("status", "unknown"))
+        p99 = svc.get("p99_latency_ms")
+        error_rate = svc.get("error_rate_percent", 0)
+        p99_str = f"{p99}ms" if p99 is not None else "n/a"
+        indicator = _service_indicator(svc_status)
+        lines.append(
+            f"  {indicator} {name:<22} {svc_status:<10} "
+            f"p99={p99_str:<10} error_rate={error_rate}%"
+        )
+
+    return "\n".join(lines)
+
+
 def execute_intent_with_result(db: Database, intent: AgentIntent) -> AgentExecution:
     time_range: Optional[TimeRange] = None
+
     if intent.time_parse_error:
         return AgentExecution(
             answer=(
@@ -491,34 +658,11 @@ def execute_intent_with_result(db: Database, intent: AgentIntent) -> AgentExecut
 
     if intent.intent == "overall_health":
         result = get_overall_health(db, time_range)
-        summary = result["summary"]
-        services = result["services"]
-        highest_error_service = (
-            max(services, key=lambda service: service["error_rate_percent"])
-            if services
-            else None
+        return AgentExecution(
+            answer=_format_overall_health_answer(result, time_range),
+            health_result=result,
+            time_range=time_range,
         )
-
-        if (
-            highest_error_service is None
-            or highest_error_service["error_rate_percent"] == 0
-        ):
-            highest_error_line = (
-                "Highest error rate service: none; no errors observed in this window"
-            )
-        else:
-            highest_error_line = (
-                f"Highest error rate service: {highest_error_service['service_name']}"
-            )
-
-        lines = [
-            f"Overall health: {result['overall_status']}",
-            f"Time range: {_format_time_range(time_range)}",
-            f"Services: total={summary['total_services']}, critical={summary['critical_services']}, degraded={summary['degraded_services']}, healthy={summary['healthy_services']}",
-            highest_error_line,
-            f"Slowest service by p99: {summary['slowest_service_by_p99']}",
-        ]
-        return AgentExecution(answer="\n".join(lines), time_range=time_range)
 
     if intent.intent == "highest_error_rate":
         highest = get_highest_error_rate_service(db, time_range.start, time_range.end)
@@ -527,7 +671,6 @@ def execute_intent_with_result(db: Database, intent: AgentIntent) -> AgentExecut
                 answer="No services found in the selected time range.",
                 time_range=time_range,
             )
-
         if highest["error_rate_percent"] == 0:
             return AgentExecution(
                 answer=(
@@ -536,26 +679,64 @@ def execute_intent_with_result(db: Database, intent: AgentIntent) -> AgentExecut
                 ),
                 time_range=time_range,
             )
-
-        lines = [
-            "Service with highest error rate:",
-            f"Time range: {_format_time_range(time_range)}",
-            f"- Service: {highest['service_name']}",
-            f"- Error rate: {highest['error_rate_percent']}%",
-            f"- Total spans: {highest['total_spans']}",
-            f"- Error spans: {highest['error_spans']}",
-            f"- p95 latency: {highest['p95_latency_ms']} ms",
-            f"- p99 latency: {highest['p99_latency_ms']} ms",
-        ]
-        return AgentExecution(answer="\n".join(lines), time_range=time_range)
+        return AgentExecution(
+            answer=_format_highest_error_rate_answer(highest, time_range),
+            health_result={"service": highest},
+            time_range=time_range,
+        )
 
     if intent.intent == "service_latency":
         if not intent.service_name:
+            result = get_overall_health(db, time_range)
+            services = result.get("services", [])
+            requested = str(intent.metric or "p99")
+            metric_label = requested.upper()
+
+            lines = [
+                f"{metric_label} Latency — All Services",
+                f"Time range: {_format_time_range(time_range)}",
+                "",
+            ]
+
+            for svc in services:
+                name = str(svc.get("service_name", "unknown"))
+                status = str(svc.get("status", "unknown"))
+                error_rate = svc.get("error_rate_percent", 0)
+                indicator = _service_indicator(status)
+
+                # Pick primary and secondary metrics based on request
+                metric_map = {
+                    "p99": svc.get("p99_latency_ms"),
+                    "p95": svc.get("p95_latency_ms"),
+                    "p50": svc.get("p50_latency_ms"),
+                    "avg": svc.get("avg_latency_ms"),
+                    "max": svc.get("max_latency_ms"),
+                }
+
+                primary_val = metric_map.get(requested)
+                # Always show p99 as secondary unless p99 is primary
+                secondary_key = "p95" if requested == "p99" else "p99"
+                secondary_val = metric_map.get(secondary_key)
+
+                primary_str = f"{primary_val}ms" if primary_val is not None else "n/a"
+                secondary_str = f"{secondary_val}ms" if secondary_val is not None else "n/a"
+
+                lines.append(
+                    f"  {indicator} {name:<22} "
+                    f"{requested}={primary_str:<10} "
+                    f"{secondary_key}={secondary_str:<10} "
+                    f"error_rate={error_rate}%"
+                )
+
+            lines.append("")
+            lines.append(
+                f"For detailed latency of a specific service, ask: "
+                f"'What is the {requested} latency for order-service?'"
+            )
+
             return AgentExecution(
-                answer=(
-                    "Could not determine which service you are asking about for latency. "
-                    "Try mentioning order, payments, cart, or catalog explicitly."
-                ),
+                answer="\n".join(lines),
+                health_result=result,
                 time_range=time_range,
             )
 
@@ -568,49 +749,34 @@ def execute_intent_with_result(db: Database, intent: AgentIntent) -> AgentExecut
         if not stats:
             return AgentExecution(
                 answer=(
-                    f"No spans found for {intent.service_name} in the selected time range."
+                    f"No spans found for {intent.service_name} "
+                    "in the selected time range."
                 ),
                 time_range=time_range,
             )
-
-        lines = [
-            f"Latency for {intent.service_name}:",
-            f"Time range: {_format_time_range(time_range)}",
-            f"- Total spans: {stats['total_spans']}",
-            f"- Average latency: {stats['avg_latency_ms']} ms",
-            f"- p50 latency: {stats['p50_latency_ms']} ms",
-            f"- p95 latency: {stats['p95_latency_ms']} ms",
-            f"- p99 latency: {stats['p99_latency_ms']} ms",
-            f"- Max latency: {stats['max_latency_ms']} ms",
-        ]
-        return AgentExecution(answer="\n".join(lines), time_range=time_range)
-
+        return AgentExecution(
+            answer=_format_service_latency_answer(
+                intent.service_name, stats, time_range
+            ),
+            health_result={"latency": stats},
+            time_range=time_range,
+        )
     if intent.intent == "checkout_health":
         result = get_checkout_flow_health(db, time_range)
-        lines = [
-            f"Checkout flow health: {result['checkout_status']}",
-            f"Time range: {_format_time_range(time_range)}",
-            str(result["interpretation"]),
-        ]
-
-        for service in result["services"]:
-            lines.append(
-                f"- {service['service_name']}: status={service['status']}, "
-                f"error_rate={service['error_rate_percent']}%, "
-                f"p95={service['p95_latency_ms']} ms, "
-                f"p99={service['p99_latency_ms']} ms"
-            )
-
-        return AgentExecution(answer="\n".join(lines), time_range=time_range)
+        return AgentExecution(
+            answer=_format_checkout_health_answer(result, time_range),
+            health_result=result,
+            time_range=time_range,
+        )
 
     examples = [
         "Examples of supported questions:",
         "- What is the overall health in the last 12 minutes?",
-        "- Which service has the highest error rate between 14:00 and 14:45?",
-        "- What is the p99 latency for the Order Service from 2pm to 2:45pm?",
-        "- Is the checkout flow operating within normal latency bounds between 14:00 and 14:45?",
+        "- Which service has the highest error rate between 10:00 and 1:40?",
+        "- What is the p99 latency for the Order Service from 1pm to 3:30pm?",
+        "- Is the checkout flow operating within normal latency bounds in the past 5 hours?",
         "- Run RCA on the most recent incident",
-        "- What was the root cause between 14:00 and 14:45?",
+        "- What was the root cause between 14:00 and 15:00?",
     ]
     return AgentExecution(
         answer="I could not understand this question with the current parser.\n"
@@ -649,8 +815,9 @@ def _maybe_synthesize_answer(
     """Optionally synthesize a final LLM answer from deterministic evidence.
 
     If synthesis is disabled or fails, return the deterministic answer.
+    RCA uses cached rca_result — no duplicate queries.
+    Health uses cached health_result + 2 targeted queries — no full evidence bundle.
     """
-
     if settings is None or not is_answer_synthesis_enabled(settings):
         return execution.answer
 
@@ -672,7 +839,15 @@ def _maybe_synthesize_answer(
         if execution.time_range is None:
             return execution.answer
 
-        evidence = collect_evidence_bundle(db, execution.time_range)
+        start = execution.time_range.start
+        end = execution.time_range.end
+
+        evidence: dict[str, object] = {
+            "time_range": execution.time_range,
+            "health_result": execution.health_result or {},
+            "error_logs_summary": get_error_logs_summary(db, start, end, limit=5),
+            "metric_anomalies": get_metric_anomalies(db, start, end),
+        }
 
         synthesized = synthesize_general_answer(
             settings=settings,

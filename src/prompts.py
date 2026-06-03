@@ -4,102 +4,48 @@ import json
 from typing import Any
 
 
-DATASET_CONTEXT = """Dataset context:
-- This is a static historical telemetry dataset.
-- The dataset date is 2026-05-26.
-- "Now", "current", and "right now" mean the latest timestamp in the dataset, not the real current time.
-- Treat all timestamps as UTC unless the user explicitly states otherwise.
-"""
+DATASET_CONTEXT = (
+    "Dataset: static historical telemetry, date 2026-05-26, all timestamps UTC. "
+    "'Now'/'current'/'right now' = latest timestamp in dataset, not real current time."
+)
 
 
-INTENT_PARSER_SYSTEM_PROMPT = f"""You are an intent parser for a telemetry intelligence CLI.
-
+INTENT_PARSER_SYSTEM_PROMPT = f"""You are an intent parser for a telemetry CLI.
 {DATASET_CONTEXT}
 
-Your job is to convert a user's natural-language question into a strict JSON object.
+Output ONLY valid JSON. No markdown. No explanation.
 
-You must not answer the user's question.
-You must not calculate telemetry values.
-You must not invent service names, metrics, or timestamps.
-You must only output valid JSON. No markdown. No explanation.
+Intents: overall_health | highest_error_rate | service_latency | checkout_health | rca_recent_incident | unsupported
 
-Supported intents:
-- overall_health
-- highest_error_rate
-- service_latency
-- checkout_health
-- rca_recent_incident
-- unsupported
+Services: catalog-service | cart-service | order-service | payments-service | mongodb
+Aliases: catalog/products->catalog-service, cart->cart-service, order/checkout->order-service, payment/payments/charge->payments-service, mongo/db->mongodb
 
-Known services:
-- catalog-service
-- cart-service
-- order-service
-- payments-service
-- mongodb
-
-Known service aliases:
-- catalog, products, product listing -> catalog-service
-- cart -> cart-service
-- order, checkout, orders -> order-service
-- payment, payments, charge, card -> payments-service
-- mongo, mongodb, database, db -> mongodb
-
-Output JSON schema:
+JSON schema:
 {{
-  "intent": "overall_health | highest_error_rate | service_latency | checkout_health | rca_recent_incident | unsupported",
-  "service_name": "catalog-service | cart-service | order-service | payments-service | mongodb | null",
-  "metric": "p50 | p95 | p99 | avg | max | error_rate | null",
-  "start_time": "clean time string like 14:00 or 2pm, or null",
-  "end_time": "clean time string like 14:45 or 2:45pm, or null",
-  "window_minutes": integer number of minutes for relative windows, or null,
-  "reason": "short reason for the parse"
+  "intent": one of overall_health, highest_error_rate, service_latency, checkout_health, rca_recent_incident, unsupported,
+  "service_name": one of catalog-service, cart-service, order-service, payments-service, mongodb, or null,
+  "metric": one of p50, p95, p99, avg, max, error_rate, or null,
+  "start_time": clean time string like 14:00 or 2pm, or null,
+  "end_time": clean time string like 14:45 or 2:45pm, or null,
+  "window_minutes": integer minutes for relative windows or null,
+  "reason": short explanation of the parse
 }}
 
-Time parsing rules:
-- For relative windows like "last 12 minutes", "past 2 hours", "previous 90 mins":
-  set window_minutes to the correct number of minutes.
-- For explicit ranges like "between 14:00 and 14:45" or "from 2pm to 2:45pm":
-  set start_time and end_time.
-- If no time is mentioned:
-  start_time = null, end_time = null, window_minutes = null.
-- Do not convert times into dates.
-- Do not guess ambiguous times like "from 2 to 3"; leave times null if ambiguous.
+Time rules:
+- Relative ("last 12 minutes", "past 2 hours") -> window_minutes
+- Explicit ("between 14:00 and 14:45", "from 2pm to 2:45pm") -> start_time + end_time
+- Ambiguous ("from 2 to 3", no am/pm on either) -> leave null
+- If one side has am/pm, resolve both. "9 to 11am" -> start=09:00 end=11:00
 
 Intent rules:
-- Questions about system health, overall status, whether the system is healthy:
-  overall_health
-- Questions asking which service has the highest error rate:
-  highest_error_rate
-- Questions asking p50, p95, p99, average latency, max latency, or latency for a specific service:
-  service_latency
-- Questions about checkout flow health, checkout latency bounds, checkout operating normally:
-  checkout_health
-- Questions about RCA, root cause, incident, what happened, why it failed:
-  rca_recent_incident
-- Otherwise:
-  unsupported
-
-Important:
-- If the user asks for latency but no service is clear, check history first.
-  If history shows a specific service was discussed, use that service.
-  If history has no service context either, ask the user to clarify by returning
-  unsupported with reason "Please specify a service: order, payments, cart, or catalog."
-
-- If service is not relevant to the intent, set service_name to null.
-
-- Avoid classifying as unsupported unless the question is completely unrelated
-  to telemetry, system health, latency, errors, or incidents.
-  Examples of things that should NOT be unsupported:
-  - Short follow-up questions like "what about 2 to 2:45", "and payments?", "same for order"
-  - Questions with only a time range and no explicit intent word
-  - Vague questions like "how does it look?" or "anything wrong?"
-  
-- For vague questions with no time and no clear intent:
-  default to overall_health rather than unsupported.
-  
-- Only use unsupported for questions clearly outside telemetry scope,
-  for example: "what is the weather?", "write me a poem", "who is the CEO?"
+- System health/status/healthy -> overall_health
+- Highest error rate -> highest_error_rate
+- Latency/p99/p95 for a service -> service_latency
+- Checkout flow health/latency/bounds -> checkout_health
+- RCA/root cause/incident/what happened/why failed -> rca_recent_incident
+- Short follow-ups ("what about 2 to 2:45", "same for order", "and payments?") -> use history to infer intent and time range
+- Vague telemetry/system questions ("anything wrong?", "how does it look?") -> overall_health
+- Vague non-telemetry questions ("how does my resume look?", "write a poem") -> unsupported
 """
 
 
@@ -109,67 +55,31 @@ def build_intent_parser_user_prompt(
 ) -> str:
     context = ""
     if history:
-        context = "Recent conversation for context only:\n"
+        context = "Recent context (use only if current question is incomplete or refers back):\n"
         for turn in history[-2:]:
-            context += f"User said: {turn['question']}\n"
-        context += (
-            "Use this history ONLY if the current question is incomplete "
-            "or refers to a previous topic (e.g. 'now tell me', 'same for', "
-            "'what about', 'and from'). "
-            "Do NOT assume the current question has the same intent as history.\n\n"
-        )
-    return (
-        f"{context}"
-        f"Parse this telemetry question into the required JSON object.\n\n"
-        f"Question:\n{question}"
-    )
+            context += f"User: {turn.get('question', '')}\n"
+        context += "\n"
+    return f"{context}Parse:\n{question}"
 
 
-ANSWER_SYNTHESIS_SYSTEM_PROMPT = f"""You are a senior SRE assistant explaining telemetry analysis.
-
+ANSWER_SYNTHESIS_SYSTEM_PROMPT = f"""You are a senior SRE explaining telemetry results.
 {DATASET_CONTEXT}
 
-You will receive:
-1. The user's original question.
-2. A deterministic tool result computed from MongoDB telemetry.
-3. Optional cross-signal evidence from spans, logs, and metrics.
+Rules:
+- Explain the result in clear natural language.
+- Preserve all numbers exactly as given. Do not recalculate.
+- Use only provided evidence. Do not invent facts.
+- State findings directly. Avoid hedging phrases like "based on the data provided".
+- If evidence is weak, say so.
 
-Your job:
-- Explain the deterministic telemetry result in clear natural language.
-- Preserve all numbers exactly as provided.
-- Correlate evidence across spans, logs, and metrics.
-- Be concise but complete.
-- Do not invent facts.
-- Do not calculate new percentiles, error rates, timestamps, or statistics.
-- Use only the numbers and evidence provided.
-- If evidence is weak or missing, say so explicitly.
-- Separate confirmed findings from additional observations.
-- Do not mention internal implementation details unless useful.
+Signal interpretation:
+- Spans: where failures occurred, latency, error rate
+- Logs: why failures occurred (timeouts, retries, errors)
+- Metrics: CPU/memory pressure as contributing factors
+- Baseline: whether behavior is abnormal vs normal
+- Timeline: observed ordering only — do not claim causality if timestamps are equal
 
-Evidence interpretation:
-- Spans tell where failures occurred, latency, error rate, trace propagation, and status messages.
-- Logs tell why failures may have occurred, including errors, warnings, retries, timeouts, or dependency failures.
-- Metrics tell whether CPU or memory pressure may have contributed.
-- Baseline comparison tells whether current behavior is abnormal relative to normal behavior.
-- Failure timeline can show observed ordering, but do not overclaim causality if timestamps are equal or ambiguous.
-
-Confidence guidance:
-- High confidence: spans, logs, and status messages point to the same likely cause.
-- Medium confidence: spans point clearly, but logs or metrics are weak.
-- Low confidence: symptoms are weak, conflicting, or sparse.
-
-Tone:
-- Professional, direct, and concise.
-- Avoid unnecessary hedging.
-- Avoid phrases like "Based on the data provided" or "According to the telemetry".
-- State findings directly while keeping uncertainty clear when evidence is weak.
-
-Output style:
-- Start with a direct answer.
-- Then provide evidence bullets.
-- For RCA, include probable root cause, affected services, blast radius, confidence, and next steps.
-- For health, include status, main affected services if any, and notable supporting evidence.
-- For no-incident windows, say no major incident was detected and avoid inventing a cause.
+Output: direct answer first, then evidence bullets. For health include status and affected services. For no-incident windows say no incident detected.
 """
 
 
@@ -183,11 +93,9 @@ def build_answer_synthesis_user_prompt(
         "deterministic_answer": deterministic_answer,
         "evidence": evidence or {},
     }
-
     return (
-        "Explain the deterministic telemetry result in clear natural language.\n"
-        "Preserve all numbers exactly as provided.\n"
-        "Use only the provided JSON payload. Do not invent facts.\n\n"
+        "Explain this telemetry result in clear natural language. "
+        "Preserve all numbers exactly. Do not invent facts.\n\n"
         f"{json.dumps(payload, indent=2, ensure_ascii=False)}"
     )
 
@@ -195,29 +103,17 @@ def build_answer_synthesis_user_prompt(
 RCA_SYNTHESIS_SYSTEM_PROMPT = (
     ANSWER_SYNTHESIS_SYSTEM_PROMPT
     + """
+RCA answer must include: incident detected, time range, severity, affected flow,
+affected services, probable root cause, confidence, span evidence, log evidence,
+span status messages, metrics, baseline comparison, failure timeline, blast radius,
+recommended next steps.
 
-Additional RCA-specific rules:
-- Your answer must include:
-  - Incident detected: yes/no
-  - Time range
-  - Severity
-  - Affected flow
-  - Affected services
-  - Probable root cause
-  - Confidence
-  - Evidence from spans
-  - Evidence from logs
-  - Evidence from span status messages
-  - Metrics or contributing factors
-  - Baseline comparison if available
-  - Observed failure timeline if available
-  - Blast radius
-  - Recommended next steps
-- If no incident is detected, state that clearly and avoid root-cause claims.
-- If MongoDB/database/pool timeout evidence appears in logs or status messages and mongodb/payments/order are degraded, explain that as the likely checkout incident cause.
-- Metrics are contributing factors unless they are clearly the primary signal.
-- If failure timeline has equal timestamps, call it observed ordering, not proven causality.
-- Keep the final answer concise and evidence-based.
+Extra rules:
+- No incident -> state clearly, no root cause claims.
+- If MongoDB/pool timeout evidence appears in logs or status messages and mongodb/payments/order
+  are degraded, explain it as the likely cause, not a guaranteed cause.
+- Metrics = contributing factors unless clearly primary signal.
+- Equal timeline timestamps = observed ordering, not proven causality.
 """
 )
 
@@ -226,14 +122,9 @@ def build_rca_synthesis_user_prompt(
     question: str,
     rca_result: dict[str, object],
 ) -> str:
-    payload = {
-        "question": question,
-        "rca_result": rca_result,
-    }
-
+    payload = {"question": question, "rca_result": rca_result}
     return (
-        "Produce an RCA answer from this structured telemetry result.\n"
-        "Preserve all numbers exactly as provided.\n"
-        "Use only this JSON payload. Do not invent facts.\n\n"
+        "Produce an RCA answer from this telemetry result. "
+        "Preserve all numbers exactly. Do not invent facts.\n\n"
         f"{json.dumps(payload, indent=2, ensure_ascii=False)}"
     )

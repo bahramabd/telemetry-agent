@@ -75,7 +75,11 @@ def run() -> None:
     history: list[dict] = []
 
     while True:
-        user_input = input("> ").strip()
+        try:
+            user_input = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print("\nGoodbye.")
+            break
 
         if user_input.lower() in {"exit", "quit", "q"}:
             console.print("Goodbye.")
@@ -84,7 +88,13 @@ def run() -> None:
         if not user_input:
             continue
 
-        answer = answer_question(db, user_input, settings, history=history)
+        try:
+            answer = answer_question(db, user_input, settings, history=history)
+        except Exception as e:
+            console.print(f"[red]Error processing question: {e}[/red]")
+            console.print("[dim]Please try again or type 'exit' to quit.[/dim]")
+            continue
+
         console.print(answer)
 
         # Update history after each turn — keep last 3 only

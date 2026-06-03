@@ -15,6 +15,23 @@ from src.telemetry.serialization import (
     serialize_rca_result_for_llm,
 )
 
+def _build_slim_rca_payload(rca_result: dict) -> dict:   # ← ADD HERE
+    """Extract only what LLM needs — skip raw spans and trace details."""
+    return {
+        "incident_detected": rca_result.get("incident_detected"),
+        "severity": rca_result.get("severity"),
+        "affected_flow": rca_result.get("affected_flow"),
+        "affected_services": rca_result.get("affected_services"),
+        "probable_root_cause": rca_result.get("probable_root_cause"),
+        "confidence": rca_result.get("confidence"),
+        "blast_radius": rca_result.get("blast_radius"),
+        "top_slow_operations": rca_result.get("top_slow_operations", [])[:5],
+        "error_logs_summary": rca_result.get("error_logs_summary", [])[:5],
+        "metric_anomalies": rca_result.get("metric_anomalies", [])[:5],
+        "baseline_comparison": rca_result.get("baseline_comparison", [])[:5],
+        "span_status_evidence": rca_result.get("span_status_evidence", [])[:5],
+        "recommended_next_steps": rca_result.get("recommended_next_steps", []),
+    }
 
 def is_answer_synthesis_enabled(settings: Settings) -> bool:
     """Return whether LLM final-answer synthesis should be attempted."""
@@ -50,7 +67,7 @@ def synthesize_general_answer(
             system_prompt=ANSWER_SYNTHESIS_SYSTEM_PROMPT,
             user_prompt=user_prompt,
             temperature=0.2,
-            max_tokens=2000,
+            max_tokens=1200,
         )
     except LLMError:
         return None
@@ -70,7 +87,8 @@ def synthesize_rca_answer(
     deterministic RCA answer.
     """
 
-    safe_rca_result = serialize_rca_result_for_llm(rca_result)
+    slim = _build_slim_rca_payload(rca_result)          # ← ADD
+    safe_rca_result = serialize_rca_result_for_llm(slim)
 
     user_prompt = build_rca_synthesis_user_prompt(
         question=question,
