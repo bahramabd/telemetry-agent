@@ -1,6 +1,6 @@
 # Telemetry Intelligence Agent
 
-A conversational AI agent that reasons over distributed system telemetry from an e-commerce microservices stack. Ask questions in natural language — the agent queries real MongoDB telemetry data, computes deterministic answers, and optionally synthesizes rich narrative responses using an LLM.
+A conversational AI agent that reasons over distributed system telemetry from an e-commerce microservices stack. Ask questions in natural language; The agent queries real MongoDB telemetry data, computes deterministic answers, and optionally synthesizes rich narrative responses using an LLM.
 
 Built for the **Decision Compute Infrastructure** assessment.
 
@@ -115,6 +115,17 @@ DEBUG_INTENT=false
 ```bash
 python -m src.main
 ```
+
+## The System Under Test
+
+An e-commerce platform with 4 microservices:
+
+- **catalog-service** — product listings with personalisation signals from cart
+- **cart-service** — user cart state and item management  
+- **order-service** — checkout orchestration (cart → payments → fulfilment)
+- **payments-service** — payment processing, calls MongoDB for transactions
+
+Two flows: **Listing** (catalog → cart) and **Checkout** (order → cart → payments → MongoDB).
 
 ---
 
