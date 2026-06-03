@@ -39,7 +39,7 @@ The agent runs as a Docker container. MongoDB must be running on your host machi
 ```bash
 docker run -it \
   --env MONGO_URI=mongodb://host.docker.internal:27017/telemetry \
-  --env LLM_API_KEY= \
+  --env LLM_API_KEY=your-api-key \
   telemetry-agent
 ```
 
@@ -47,7 +47,7 @@ docker run -it \
 ```powershell
 docker run -it `
   --env MONGO_URI=mongodb://host.docker.internal:27017/telemetry `
-  --env LLM_API_KEY= `
+  --env LLM_API_KEY=your-api-key `
   telemetry-agent
 ```
 
@@ -59,12 +59,12 @@ docker run -it `
 ```bash
 docker run -it `
   --env MONGO_URI=mongodb://host.docker.internal:27017/telemetry `
-  --env LLM_API_KEY=<your-openai-api-key> `
+  --env LLM_API_KEY=<your-api-key> `
   --env ENABLE_LLM_SYNTHESIS=true `
   telemetry-agent
 ```
 
-> **Note:** `ENABLE_LLM_SYNTHESIS=false` (the default) still uses the LLM for intent parsing — it only disables the optional final-answer narrative rewrite. The agent works correctly and produces detailed evidence-based answers either way. Enabling synthesis adds richer prose explanations at the cost of slightly longer response times (~2–4 seconds extra per query).
+> **Note:** `ENABLE_LLM_SYNTHESIS=false` (the default) still uses the LLM for intent parsing — it only disables the optional final-answer narrative rewrite. The agent works correctly and produces detailed evidence-based answers either way. Enabling synthesis adds richer prose explanations at the cost of slightly longer response times (~2–4 seconds extra per query). 
 
 
 ## Running Locally (Without Docker)
