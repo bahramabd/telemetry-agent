@@ -9,4 +9,4 @@ data/*.zip
 .ruff_cache/
 .mypy_cache/
 dist/
-build/
+build/venv/
