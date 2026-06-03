@@ -33,14 +33,26 @@ The agent connects to a MongoDB database containing OpenTelemetry-compatible spa
 
 The agent runs as a Docker container. MongoDB must be running on your host machine with the telemetry dataset imported.
 
-### Minimum working command
+## Running The Agent
 
+**Linux / macOS:**
 ```bash
-docker run -it `
-  --env MONGO_URI=mongodb://host.docker.internal:27017/telemetry `
-  --env LLM_API_KEY=<your-openai-api-key> `
+docker run -it \
+  --env MONGO_URI=mongodb://host.docker.internal:27017/telemetry \
+  --env LLM_API_KEY= \
   telemetry-agent
 ```
+
+**Windows (PowerShell):**
+```powershell
+docker run -it `
+  --env MONGO_URI=mongodb://host.docker.internal:27017/telemetry `
+  --env LLM_API_KEY= `
+  telemetry-agent
+```
+
+> On Linux/macOS use `\` for line continuation. On Windows PowerShell use `` ` ``.
+> On Windows Command Prompt (cmd.exe) use `^` instead.
 
 ### With LLM synthesis enabled (richer narrative answers)
 
@@ -213,4 +225,9 @@ The RCA output includes: incident detection, severity, affected flow, probable r
 
 ```bash
 docker build -t telemetry-agent .
+```
+## Loading The Docker Image
+
+```bash
+docker load -i telemetry-agent.tar
 ```
